@@ -73,128 +73,7 @@ print_info() {
     echo -e "${BLUE}${ICON_INFO}  $1${NC}"
 }
 
-prompt_license_key() {
-    local response=""
 
-    while true; do
-        if [ -n "$LICENSE_KEY" ]; then
-            return 0
-        fi
-
-        read -p "Enter license key (required): " response
-        response=$(echo "$response" | tr -d '[:space:]')
-
-        if [ -z "$response" ]; then
-            print_warning "License key is required."
-            continue
-        fi
-
-        LICENSE_KEY="$response"
-        return 0
-    done
-}
-
-license_url_for_role() {
-    local role="$1"
-    if [ "$role" = "server" ]; then
-        echo "$LICENSE_URL_SERVER"
-    else
-        echo "$LICENSE_URL_CLIENT"
-    fi
-}
-
-upsert_license_block() {
-    local config_file="$1"
-    local role="$2"
-    local license_url=""
-    local tmp_file=""
-
-    [ -f "$config_file" ] || return 1
-    if [ -z "$LICENSE_KEY" ]; then
-        print_error "License key is empty; cannot write license block to $config_file"
-        return 1
-    fi
-    license_url=$(license_url_for_role "$role")
-    tmp_file="${config_file}.tmp"
-
-    awk -v lkey="$LICENSE_KEY" -v lurl="$license_url" '
-        function print_license_block() {
-            print "# License (required)"
-            print "license:"
-            print "  key: \"" lkey "\""
-            print "  url: \"" lurl "\""
-        }
-        BEGIN {
-            in_license = 0
-            replaced = 0
-        }
-        {
-            if ($0 ~ /^license:[[:space:]]*$/) {
-                if (!replaced) {
-                    print_license_block()
-                    replaced = 1
-                }
-                in_license = 1
-                next
-            }
-
-            if (in_license) {
-                if ($0 ~ /^[^[:space:]]/) {
-                    in_license = 0
-                    print $0
-                }
-                next
-            }
-
-            print $0
-        }
-        END {
-            if (!replaced) {
-                if (NR > 0) {
-                    print ""
-                }
-                print_license_block()
-            }
-        }
-    ' "$config_file" > "$tmp_file" || return 1
-
-    mv "$tmp_file" "$config_file"
-    return 0
-}
-
-apply_license_to_existing_configs() {
-    local updated=0
-    local service_file=""
-
-    for service_file in /etc/systemd/system/paqet-*.service; do
-        [ -f "$service_file" ] || continue
-
-        local config_file
-        local role
-        local service_name
-        service_name=$(basename "$service_file" .service)
-        config_file=$(resolve_service_config_path "$service_file")
-        [ -n "$config_file" ] && [ -f "$config_file" ] || continue
-
-        if grep -q 'role:[[:space:]]*"server"' "$config_file"; then
-            role="server"
-        else
-            role="client"
-        fi
-
-        if upsert_license_block "$config_file" "$role"; then
-            chmod 600 "$config_file" 2>/dev/null || true
-            print_success "License updated in $service_name config"
-            updated=$((updated + 1))
-        fi
-    done
-
-    if [ "$updated" -eq 0 ]; then
-        print_warning "No existing paqet configs found for license update."
-    else
-        print_success "Applied license block to $updated config(s)."
-    fi
-}
 
 render_kypaqet_banner() {
     echo -e "${CYAN}"
@@ -885,7 +764,7 @@ resolve_paqet_binary() {
 
 # Get latest paqet release tag from GitHub API
 get_latest_paqet_version() {
-    local repo="${PAQET_REPO:-diyakou/paqet}"
+    local repo="${PAQET_REPO:-Kamikazie98/paqet_main}"
     local api_url="https://api.github.com/repos/${repo}/releases/latest"
     local version=""
 
@@ -1377,6 +1256,40 @@ download_paqet_binary() {
 
     print_info "Detected: $os-$paqet_arch"
 
+    # ─── Self-hosted server download (if PAQET_SERVER is set) ────────────
+    if [ -n "$PAQET_SERVER" ]; then
+        local server_url="${PAQET_SERVER%/}"
+        local self_hosted_url="${server_url}/bin/paqet-linux-${paqet_arch}"
+        print_info "Downloading from self-hosted server: $self_hosted_url"
+
+        local install_target="$PAQET_PATH/paqet"
+        if [ "$force_update" = "true" ] && [ -n "$existing_binary" ]; then
+            install_target="$existing_binary"
+        fi
+
+        mkdir -p "$(dirname "$install_target")"
+        local tmp_bin
+        tmp_bin=$(mktemp)
+
+        local dl_ok=0
+        if command -v curl &>/dev/null; then
+            curl -fsSL -o "$tmp_bin" "$self_hosted_url" && dl_ok=1
+        elif command -v wget &>/dev/null; then
+            wget -qO "$tmp_bin" "$self_hosted_url" && dl_ok=1
+        fi
+
+        if [ "$dl_ok" -eq 1 ] && [ -s "$tmp_bin" ]; then
+            mv "$tmp_bin" "$install_target"
+            chmod +x "$install_target"
+            print_success "Paqet binary installed from server: $install_target"
+            return 0
+        else
+            rm -f "$tmp_bin"
+            print_warning "Self-hosted download failed, falling back to GitHub..."
+        fi
+    fi
+
+    # ─── GitHub release download ─────────────────────────────────────────
     # Get version from override or GitHub API
     local version="${PAQET_VERSION:-}"
     if [ -n "$version" ]; then
@@ -1527,12 +1440,7 @@ update_paqet_core() {
     print_header "Updating Paqet Core"
     check_root
 
-    if [ -z "$LICENSE_KEY" ]; then
-        prompt_license_key
-    fi
-
     if download_paqet_binary "true"; then
-        apply_license_to_existing_configs
         restart_active_tunnels_after_update
         print_success "Paqet core update completed"
     else
@@ -1652,8 +1560,6 @@ transport:
     streambuf: $KCP_STREAMBUF     # Stream buffer
 EOF
 
-    upsert_license_block "$config_file" "client"
-
     chmod 600 "$config_file"
     print_success "Client configuration created: $config_file"
     if [ "$PROXY_TYPE" = "socks5" ]; then
@@ -1732,8 +1638,6 @@ transport:
     smuxbuf: $KCP_SMUXBUF         # SMUX buffer
     streambuf: $KCP_STREAMBUF     # Stream buffer
 EOF
-
-    upsert_license_block "$config_file" "server"
 
     chmod 600 "$config_file"
     print_success "Server configuration created: $config_file"
@@ -2628,11 +2532,9 @@ FORWARD_RULES=""  # Semicolon-separated: "local:target_host:target_port[:protoco
 FORWARD_PORTS=""  # User input format: "443=443,8443=8080"
 ENCRYPTION_KEY=""
 PAQET_PATH="."
-PAQET_REPO="diyakou/paqet"
+PAQET_REPO="Kamikazie98/paqet_main"
 PAQET_VERSION=""
-LICENSE_KEY=""
-LICENSE_URL_CLIENT="http://paqet.morvism.ir:8080"
-LICENSE_URL_SERVER="http://paqet-server.morvism.ir:8080"
+PAQET_SERVER=""
 KCP_MODE="manual"
 CONN_COUNT="3"
 MTU="1280"
@@ -2700,12 +2602,12 @@ if [[ $# -gt 0 ]]; then
                         ENCRYPTION_KEY="$2"
                         shift 2
                         ;;
-                    --license-key)
-                        LICENSE_KEY="$2"
-                        shift 2
-                        ;;
                     --core-repo)
                         PAQET_REPO="$2"
+                        shift 2
+                        ;;
+                    --server)
+                        PAQET_SERVER="$2"
                         shift 2
                         ;;
                     --core-version)
@@ -2798,10 +2700,6 @@ while [[ $# -gt 0 ]]; do
             ENCRYPTION_KEY="$2"
             shift 2
             ;;
-        --license-key)
-            LICENSE_KEY="$2"
-            shift 2
-            ;;
         --proxy-type)
             PROXY_TYPE="$2"
             shift 2
@@ -2850,8 +2748,6 @@ fi  # End of legacy block
 # Interactive input collection for single tunnel
 get_single_tunnel_input() {
     echo -e "\n${GREEN}Mode: ${MODE^^}${NC}"
-
-    prompt_license_key
     
     # Client-specific questions
     if [ "$MODE" = "client" ]; then
@@ -2988,8 +2884,6 @@ get_multi_client_input() {
     echo -e "\n${CYAN}[MULTI-SERVER CLIENT SETUP]${NC}"
     echo -e "${YELLOW}You will connect this client to multiple Kharej servers.${NC}"
     echo -e "${YELLOW}Each server will have its own tunnel and service.${NC}\n"
-
-    prompt_license_key
     
     echo -e "${YELLOW}Smart Connection Tuning (applies to all tunnels):${NC}"
     ask_max_online_users_and_apply_profile "client"
@@ -3088,8 +2982,6 @@ get_multi_server_input() {
     echo -e "\n${CYAN}[MULTI-CLIENT SERVER SETUP]${NC}"
     echo -e "${YELLOW}This server will accept connections from multiple Iran clients.${NC}"
     echo -e "${YELLOW}Each client will have its own tunnel, port, and encryption key.${NC}\n"
-
-    prompt_license_key
     
     echo -e "${YELLOW}Smart Connection Tuning (applies to all tunnels):${NC}"
     ask_max_online_users_and_apply_profile "server"
@@ -4117,7 +4009,6 @@ handle_cli_args() {
             echo "  --update-core       Download and install latest paqet core binary"
             echo "  --core-version TAG  Pin core version/tag for downloads/updates"
             echo "  --core-repo REPO    Core release repo (default: diyakou/paqet)"
-            echo "  --license-key KEY   Set required license key"
             echo "  --update            Alias for --update-core"
             echo "  --install           Install script to /usr/local/bin (run as 'paqet')"
             echo "  --uninstall         Remove script from /usr/local/bin"
