@@ -31,7 +31,7 @@
 روی **هر دو سرور (ایران و خارج)** اجرا کنید:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/diyakou/paqet-tunnel/master/deploy-tunnel.sh -o deploy.sh && chmod +x deploy.sh && sudo ./deploy.sh
+curl -fsSL https://raw.githubusercontent.com/Kamikazie98/paqet/master/deploy-tunnel.sh -o deploy.sh && chmod +x deploy.sh && sudo ./deploy.sh
 ```
 
 ---
